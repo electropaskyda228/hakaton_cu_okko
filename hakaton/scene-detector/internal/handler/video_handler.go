@@ -9,6 +9,7 @@ import (
 	"scene-detector/internal/repository"
 	"scene-detector/pkg/ffmpeg"
 	minioClient "scene-detector/pkg/minio"
+	"strings"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -119,6 +120,9 @@ func (h *VideoHandler) ProcessVideo(c *gin.Context) {
 	// Извлекаем кадры для каждой сцены
 	scenes := make([]SceneResponse, 0, len(sceneTimes))
 
+	// Очищаем имя видео для использования в путях (убираем расширение)
+	cleanVideoName := strings.TrimSuffix(header.Filename, filepath.Ext(header.Filename))
+
 	for i, startTime := range sceneTimes {
 		// Определяем конец сцены
 		var endTime float64
@@ -128,7 +132,7 @@ func (h *VideoHandler) ProcessVideo(c *gin.Context) {
 			endTime = duration
 		}
 
-		// Берем кадр из середины сцены (лучше представляет сцену)
+		// Берем кадр из середины сцены
 		middleTime := startTime + (endTime-startTime)/2
 
 		// Создаем временный файл для кадра
@@ -154,11 +158,12 @@ func (h *VideoHandler) ProcessVideo(c *gin.Context) {
 			return
 		}
 
-		// Загружаем в MinIO
-		objectName := fmt.Sprintf("scenes/%s/scene_%d_%s.jpg",
-			header.Filename,
-			i,
-			uuid.New().String())
+		// Загружаем в MinIO с разбивкой по папкам:
+		// scenes/{video_name}/scene_{номер}/frame.jpg
+		sceneNumber := i + 1
+		objectName := fmt.Sprintf("scenes/%s/scene_%03d/frame.jpg",
+			cleanVideoName,
+			sceneNumber)
 
 		frameURL, err := h.minioClient.UploadFile(
 			c.Request.Context(),
@@ -175,17 +180,18 @@ func (h *VideoHandler) ProcessVideo(c *gin.Context) {
 			return
 		}
 
-		// Извлекаем аудио для сцены (опционально)
+		// Извлекаем аудио для сцены
 		audioURL := ""
 		audioPath := filepath.Join(h.tempDir, fmt.Sprintf("audio_%d_%s.mp3", i, uuid.New().String()))
 		if err := h.sceneDetector.ExtractAudio(videoPath, startTime, endTime, audioPath); err == nil {
 			audioFile, _ := os.Open(audioPath)
 			audioInfo, _ := audioFile.Stat()
 
-			audioObjectName := fmt.Sprintf("scenes/%s/audio/scene_%d_%s.mp3",
-				header.Filename,
-				i,
-				uuid.New().String())
+			// Загружаем аудио в ту же папку сцены:
+			// scenes/{video_name}/scene_{номер}/audio.mp3
+			audioObjectName := fmt.Sprintf("scenes/%s/scene_%03d/audio.mp3",
+				cleanVideoName,
+				sceneNumber)
 
 			audioURL, _ = h.minioClient.UploadFile(
 				c.Request.Context(),
@@ -201,7 +207,7 @@ func (h *VideoHandler) ProcessVideo(c *gin.Context) {
 		// Сохраняем метаданные в БД
 		scene := &model.Scene{
 			VideoName:        header.Filename,
-			SceneNumber:      i + 1,
+			SceneNumber:      sceneNumber,
 			StartTimeSeconds: startTime,
 			EndTimeSeconds:   endTime,
 			FrameURL:         frameURL,
