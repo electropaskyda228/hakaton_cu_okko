@@ -58,7 +58,6 @@ func (h *VideoHandler) ProcessVideo(c *gin.Context) {
 		return
 	}
 
-	// Получаем файл из запроса
 	file, header, err := c.Request.FormFile("file")
 	if err != nil {
 		c.JSON(400, gin.H{"error": "file is required"})
@@ -66,7 +65,6 @@ func (h *VideoHandler) ProcessVideo(c *gin.Context) {
 	}
 	defer file.Close()
 
-	// Создаем временный файл для видео
 	videoPath := filepath.Join(h.tempDir, uuid.New().String()+"_"+header.Filename)
 	videoFile, err := os.Create(videoPath)
 	if err != nil {
@@ -75,7 +73,6 @@ func (h *VideoHandler) ProcessVideo(c *gin.Context) {
 	}
 	defer os.Remove(videoPath)
 
-	// Копируем загруженный файл
 	if _, err := io.Copy(videoFile, file); err != nil {
 		videoFile.Close()
 		c.JSON(500, gin.H{"error": "failed to save file"})
@@ -83,13 +80,26 @@ func (h *VideoHandler) ProcessVideo(c *gin.Context) {
 	}
 	videoFile.Close()
 
-	// Получаем информацию о видео (FPS)
-	fps, _, err := h.sceneDetector.GetVideoInfo(videoPath)
+	// Получаем FPS
+	fps, err := h.sceneDetector.GetVideoFPS(videoPath)
 	if err != nil {
-		// Если не удалось получить FPS, используем значение по умолчанию 24
 		fps = 24.0
 	}
-	frameInterval := int(fps) // каждый 24-й кадр при 24 fps
+
+	// Будем анализировать каждый 24-й кадр
+	frameInterval := int(fps) // 24 при 24 fps
+
+	// Детектируем сцены, анализируя только каждый 24-й кадр (БЫСТРО!)
+	threshold := req.Threshold
+	if threshold == 0 {
+		threshold = 0.3
+	}
+
+	sceneTimes, err := h.sceneDetector.DetectScenesWithInterval(videoPath, threshold, frameInterval)
+	if err != nil {
+		c.JSON(500, gin.H{"error": fmt.Sprintf("failed to detect scenes: %v", err)})
+		return
+	}
 
 	// Получаем длительность видео
 	duration, err := h.sceneDetector.GetVideoDuration(videoPath)
@@ -98,19 +108,15 @@ func (h *VideoHandler) ProcessVideo(c *gin.Context) {
 		return
 	}
 
-	// Детектируем сцены
-	threshold := req.Threshold
-	if threshold == 0 {
-		threshold = 0.3
-	}
-
-	sceneTimes, err := h.sceneDetector.DetectScenes(videoPath, threshold)
-	if err != nil {
-		c.JSON(500, gin.H{"error": fmt.Sprintf("failed to detect scenes: %v", err)})
+	// Создаем временную директорию для кадров
+	framesDir := filepath.Join(h.tempDir, "frames_"+uuid.New().String())
+	if err := os.MkdirAll(framesDir, 0755); err != nil {
+		c.JSON(500, gin.H{"error": "failed to create frames dir"})
 		return
 	}
+	defer os.RemoveAll(framesDir)
 
-	// Извлекаем кадры и аудио для каждой сцены
+	// Извлекаем кадры для каждой сцены
 	scenes := make([]SceneResponse, 0, len(sceneTimes))
 
 	for i, startTime := range sceneTimes {
@@ -122,13 +128,14 @@ func (h *VideoHandler) ProcessVideo(c *gin.Context) {
 			endTime = duration
 		}
 
+		// Берем кадр из середины сцены (лучше представляет сцену)
+		middleTime := startTime + (endTime-startTime)/2
+
 		// Создаем временный файл для кадра
 		framePath := filepath.Join(h.tempDir, fmt.Sprintf("frame_%d_%s.jpg", i, uuid.New().String()))
 
-		// Извлекаем кадр с учетом интервала (каждый frameInterval-й кадр)
-		// Берем кадр из середины сцены для лучшего представления
-		middleTime := startTime + (endTime-startTime)/2
-		if err := h.sceneDetector.ExtractFrameWithInterval(videoPath, middleTime, frameInterval, framePath); err != nil {
+		// Извлекаем кадр
+		if err := h.sceneDetector.ExtractFrame(videoPath, middleTime, framePath); err != nil {
 			c.JSON(500, gin.H{"error": fmt.Sprintf("failed to extract frame %d: %v", i, err)})
 			return
 		}
@@ -140,7 +147,6 @@ func (h *VideoHandler) ProcessVideo(c *gin.Context) {
 			return
 		}
 
-		// Получаем размер файла
 		frameInfo, err := frameFile.Stat()
 		if err != nil {
 			frameFile.Close()
@@ -148,8 +154,8 @@ func (h *VideoHandler) ProcessVideo(c *gin.Context) {
 			return
 		}
 
-		// Загружаем кадр в MinIO
-		frameObjectName := fmt.Sprintf("scenes/%s/frames/scene_%d_%s.jpg",
+		// Загружаем в MinIO
+		objectName := fmt.Sprintf("scenes/%s/scene_%d_%s.jpg",
 			header.Filename,
 			i,
 			uuid.New().String())
@@ -159,7 +165,7 @@ func (h *VideoHandler) ProcessVideo(c *gin.Context) {
 			frameFile,
 			frameInfo.Size(),
 			"image/jpeg",
-			frameObjectName,
+			objectName,
 		)
 		frameFile.Close()
 		os.Remove(framePath)
@@ -169,46 +175,27 @@ func (h *VideoHandler) ProcessVideo(c *gin.Context) {
 			return
 		}
 
-		// Извлекаем аудио для сцены
+		// Извлекаем аудио для сцены (опционально)
+		audioURL := ""
 		audioPath := filepath.Join(h.tempDir, fmt.Sprintf("audio_%d_%s.mp3", i, uuid.New().String()))
-		if err := h.sceneDetector.ExtractAudio(videoPath, startTime, endTime, audioPath); err != nil {
-			c.JSON(500, gin.H{"error": fmt.Sprintf("failed to extract audio %d: %v", i, err)})
-			return
-		}
+		if err := h.sceneDetector.ExtractAudio(videoPath, startTime, endTime, audioPath); err == nil {
+			audioFile, _ := os.Open(audioPath)
+			audioInfo, _ := audioFile.Stat()
 
-		// Открываем аудио файл
-		audioFile, err := os.Open(audioPath)
-		if err != nil {
-			c.JSON(500, gin.H{"error": fmt.Sprintf("failed to open audio %d: %v", i, err)})
-			return
-		}
+			audioObjectName := fmt.Sprintf("scenes/%s/audio/scene_%d_%s.mp3",
+				header.Filename,
+				i,
+				uuid.New().String())
 
-		audioInfo, err := audioFile.Stat()
-		if err != nil {
+			audioURL, _ = h.minioClient.UploadFile(
+				c.Request.Context(),
+				audioFile,
+				audioInfo.Size(),
+				"audio/mpeg",
+				audioObjectName,
+			)
 			audioFile.Close()
-			c.JSON(500, gin.H{"error": fmt.Sprintf("failed to get audio info %d: %v", i, err)})
-			return
-		}
-
-		// Загружаем аудио в MinIO
-		audioObjectName := fmt.Sprintf("scenes/%s/audio/scene_%d_%s.mp3",
-			header.Filename,
-			i,
-			uuid.New().String())
-
-		audioURL, err := h.minioClient.UploadFile(
-			c.Request.Context(),
-			audioFile,
-			audioInfo.Size(),
-			"audio/mpeg",
-			audioObjectName,
-		)
-		audioFile.Close()
-		os.Remove(audioPath)
-
-		if err != nil {
-			c.JSON(500, gin.H{"error": fmt.Sprintf("failed to upload audio %d: %v", i, err)})
-			return
+			os.Remove(audioPath)
 		}
 
 		// Сохраняем метаданные в БД
@@ -237,8 +224,9 @@ func (h *VideoHandler) ProcessVideo(c *gin.Context) {
 	}
 
 	c.JSON(200, gin.H{
-		"message": "video processed successfully",
-		"scenes":  scenes,
+		"message":      "video processed successfully",
+		"scenes_count": len(scenes),
+		"scenes":       scenes,
 	})
 }
 
