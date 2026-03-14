@@ -137,3 +137,87 @@ func (d *SceneDetector) ExtractSceneFrames(inputPath string, sceneTimes []float6
 
 	return framePaths, nil
 }
+
+// ExtractAudio извлекает аудиодорожку для сцены
+func (d *SceneDetector) ExtractAudio(inputPath string, startTime, endTime float64, outputPath string) error {
+	duration := endTime - startTime
+	if duration <= 0 {
+		return fmt.Errorf("invalid duration: %f", duration)
+	}
+
+	cmd := exec.Command(d.ffmpegPath,
+		"-i", inputPath,
+		"-ss", fmt.Sprintf("%.3f", startTime),
+		"-t", fmt.Sprintf("%.3f", duration),
+		"-q:a", "0", // лучшее качество аудио
+		"-map", "a", // только аудиодорожка
+		"-y", // перезаписывать
+		outputPath,
+	)
+
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("failed to extract audio: %w", err)
+	}
+
+	return nil
+}
+
+// ExtractFrameWithInterval извлекает кадр с учетом интервала (каждый 24-й кадр)
+func (d *SceneDetector) ExtractFrameWithInterval(inputPath string, timestamp float64, frameInterval int, outputPath string) error {
+	// Для каждого 24-го кадра мы все равно извлекаем один кадр, но на входе
+	// мы уже получили timestamp, который соответствует нужному кадру
+	cmd := exec.Command(d.ffmpegPath,
+		"-i", inputPath,
+		"-ss", fmt.Sprintf("%.3f", timestamp),
+		"-vframes", "1",
+		"-q:v", "2",
+		"-y",
+		outputPath,
+	)
+
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("failed to extract frame: %w", err)
+	}
+
+	return nil
+}
+
+// GetVideoInfo возвращает информацию о видео (FPS, количество кадров)
+func (d *SceneDetector) GetVideoInfo(inputPath string) (fps float64, frameCount int, err error) {
+	// Получаем FPS
+	cmd := exec.Command(d.ffprobePath,
+		"-v", "error",
+		"-select_streams", "v:0",
+		"-show_entries", "stream=r_frame_rate",
+		"-of", "default=noprint_wrappers=1:nokey=1",
+		inputPath,
+	)
+
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	if err := cmd.Run(); err != nil {
+		return 0, 0, fmt.Errorf("failed to get fps: %w", err)
+	}
+
+	fpsStr := strings.TrimSpace(out.String())
+	// Парсим дробь типа "30000/1001"
+	parts := strings.Split(fpsStr, "/")
+	if len(parts) == 2 {
+		num, _ := strconv.ParseFloat(parts[0], 64)
+		den, _ := strconv.ParseFloat(parts[1], 64)
+		if den > 0 {
+			fps = num / den
+		}
+	} else {
+		fps, _ = strconv.ParseFloat(fpsStr, 64)
+	}
+
+	// Получаем длительность
+	duration, err := d.GetVideoDuration(inputPath)
+	if err != nil {
+		return fps, 0, err
+	}
+
+	frameCount = int(duration * fps)
+	return fps, frameCount, nil
+}

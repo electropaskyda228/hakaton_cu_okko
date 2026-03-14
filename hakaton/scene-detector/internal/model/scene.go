@@ -14,6 +14,7 @@ type Scene struct {
 	StartTimeSeconds float64   `gorm:"not null" json:"start_time_seconds"`
 	EndTimeSeconds   float64   `gorm:"not null" json:"end_time_seconds"`
 	FrameURL         string    `gorm:"not null;size:1000" json:"frame_url"`
+	AudioURL         string    `gorm:"size:1000" json:"audio_url"` // Новое поле для аудио
 	CreatedAt        time.Time `gorm:"not null" json:"created_at"`
 }
 

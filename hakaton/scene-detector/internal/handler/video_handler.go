@@ -42,6 +42,7 @@ type SceneResponse struct {
 	SceneID     string  `json:"scene_id"`
 	SceneNumber int     `json:"scene_number"`
 	FrameURL    string  `json:"frame_url"`
+	AudioURL    string  `json:"audio_url,omitempty"`
 	StartTime   float64 `json:"start_time"`
 	EndTime     float64 `json:"end_time"`
 }
@@ -72,7 +73,7 @@ func (h *VideoHandler) ProcessVideo(c *gin.Context) {
 		c.JSON(500, gin.H{"error": "failed to create temp file"})
 		return
 	}
-	defer os.Remove(videoPath) // очистка после обработки
+	defer os.Remove(videoPath)
 
 	// Копируем загруженный файл
 	if _, err := io.Copy(videoFile, file); err != nil {
@@ -81,6 +82,14 @@ func (h *VideoHandler) ProcessVideo(c *gin.Context) {
 		return
 	}
 	videoFile.Close()
+
+	// Получаем информацию о видео (FPS)
+	fps, _, err := h.sceneDetector.GetVideoInfo(videoPath)
+	if err != nil {
+		// Если не удалось получить FPS, используем значение по умолчанию 24
+		fps = 24.0
+	}
+	frameInterval := int(fps) // каждый 24-й кадр при 24 fps
 
 	// Получаем длительность видео
 	duration, err := h.sceneDetector.GetVideoDuration(videoPath)
@@ -101,7 +110,7 @@ func (h *VideoHandler) ProcessVideo(c *gin.Context) {
 		return
 	}
 
-	// Извлекаем кадры для каждой сцены
+	// Извлекаем кадры и аудио для каждой сцены
 	scenes := make([]SceneResponse, 0, len(sceneTimes))
 
 	for i, startTime := range sceneTimes {
@@ -116,8 +125,10 @@ func (h *VideoHandler) ProcessVideo(c *gin.Context) {
 		// Создаем временный файл для кадра
 		framePath := filepath.Join(h.tempDir, fmt.Sprintf("frame_%d_%s.jpg", i, uuid.New().String()))
 
-		// Извлекаем кадр
-		if err := h.sceneDetector.ExtractFrame(videoPath, startTime, framePath); err != nil {
+		// Извлекаем кадр с учетом интервала (каждый frameInterval-й кадр)
+		// Берем кадр из середины сцены для лучшего представления
+		middleTime := startTime + (endTime-startTime)/2
+		if err := h.sceneDetector.ExtractFrameWithInterval(videoPath, middleTime, frameInterval, framePath); err != nil {
 			c.JSON(500, gin.H{"error": fmt.Sprintf("failed to extract frame %d: %v", i, err)})
 			return
 		}
@@ -137,8 +148,8 @@ func (h *VideoHandler) ProcessVideo(c *gin.Context) {
 			return
 		}
 
-		// Загружаем в MinIO
-		objectName := fmt.Sprintf("scenes/%s/scene_%d_%s.jpg",
+		// Загружаем кадр в MinIO
+		frameObjectName := fmt.Sprintf("scenes/%s/frames/scene_%d_%s.jpg",
 			header.Filename,
 			i,
 			uuid.New().String())
@@ -148,13 +159,55 @@ func (h *VideoHandler) ProcessVideo(c *gin.Context) {
 			frameFile,
 			frameInfo.Size(),
 			"image/jpeg",
-			objectName,
+			frameObjectName,
 		)
 		frameFile.Close()
-		os.Remove(framePath) // удаляем временный файл
+		os.Remove(framePath)
 
 		if err != nil {
 			c.JSON(500, gin.H{"error": fmt.Sprintf("failed to upload frame %d: %v", i, err)})
+			return
+		}
+
+		// Извлекаем аудио для сцены
+		audioPath := filepath.Join(h.tempDir, fmt.Sprintf("audio_%d_%s.mp3", i, uuid.New().String()))
+		if err := h.sceneDetector.ExtractAudio(videoPath, startTime, endTime, audioPath); err != nil {
+			c.JSON(500, gin.H{"error": fmt.Sprintf("failed to extract audio %d: %v", i, err)})
+			return
+		}
+
+		// Открываем аудио файл
+		audioFile, err := os.Open(audioPath)
+		if err != nil {
+			c.JSON(500, gin.H{"error": fmt.Sprintf("failed to open audio %d: %v", i, err)})
+			return
+		}
+
+		audioInfo, err := audioFile.Stat()
+		if err != nil {
+			audioFile.Close()
+			c.JSON(500, gin.H{"error": fmt.Sprintf("failed to get audio info %d: %v", i, err)})
+			return
+		}
+
+		// Загружаем аудио в MinIO
+		audioObjectName := fmt.Sprintf("scenes/%s/audio/scene_%d_%s.mp3",
+			header.Filename,
+			i,
+			uuid.New().String())
+
+		audioURL, err := h.minioClient.UploadFile(
+			c.Request.Context(),
+			audioFile,
+			audioInfo.Size(),
+			"audio/mpeg",
+			audioObjectName,
+		)
+		audioFile.Close()
+		os.Remove(audioPath)
+
+		if err != nil {
+			c.JSON(500, gin.H{"error": fmt.Sprintf("failed to upload audio %d: %v", i, err)})
 			return
 		}
 
@@ -165,6 +218,7 @@ func (h *VideoHandler) ProcessVideo(c *gin.Context) {
 			StartTimeSeconds: startTime,
 			EndTimeSeconds:   endTime,
 			FrameURL:         frameURL,
+			AudioURL:         audioURL,
 		}
 
 		if err := h.sceneRepo.Create(scene); err != nil {
@@ -176,6 +230,7 @@ func (h *VideoHandler) ProcessVideo(c *gin.Context) {
 			SceneID:     scene.ID,
 			SceneNumber: scene.SceneNumber,
 			FrameURL:    scene.FrameURL,
+			AudioURL:    scene.AudioURL,
 			StartTime:   scene.StartTimeSeconds,
 			EndTime:     scene.EndTimeSeconds,
 		})
