@@ -141,11 +141,10 @@ func (d *SceneDetector) ExtractFramesWithInterval(inputPath string, frameInterva
 // DetectScenesWithInterval детектирует сцены, анализируя каждый N-й кадр
 func (d *SceneDetector) DetectScenesWithInterval(inputPath string, threshold float64, frameInterval int) ([]float64, error) {
 	if threshold == 0 {
-		threshold = 0.3
+		threshold = 0.15 // По умолчанию ниже, так как анализируем реже
 	}
 
-	// Используем select='not(mod(n,interval))' чтобы брать каждый N-й кадр
-	// и на них применяем scene detection
+	// Берем каждый N-й кадр и на них применяем scene detection
 	cmd := exec.Command(d.ffmpegPath,
 		"-i", inputPath,
 		"-vf", fmt.Sprintf("select='not(mod(n,%d))',select='gt(scene,%.2f)',showinfo", frameInterval, threshold),
